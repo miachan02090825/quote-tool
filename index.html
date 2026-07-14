@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-TW">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>精準對帳處理中心 - 報價單與發票查驗工具</title>
+    <script>
+      window.onerror = function(message, source, lineno, colno, error) {
+        var div = document.createElement('div');
+        div.style.position = 'fixed';
+        div.style.top = '0';
+        div.style.left = '0';
+        div.style.width = '100%';
+        div.style.height = '100%';
+        div.style.backgroundColor = '#ef4444';
+        div.style.color = '#ffffff';
+        div.style.padding = '2rem';
+        div.style.zIndex = '999999';
+        div.style.fontFamily = 'monospace';
+        div.style.fontSize = '16px';
+        div.style.whiteSpace = 'pre-wrap';
+        div.style.overflowY = 'auto';
+        div.innerHTML = '<h2>🚨 全域 JS 執行錯誤 / Global Error Catch</h2>' + 
+                        '<p><b>錯誤訊息:</b> ' + message + '</p>' +
+                        '<p><b>檔案位置:</b> ' + source + ' (第 ' + lineno + ' 行, 第 ' + colno + ' 列)</p>' +
+                        '<pre style="margin-top: 1rem; padding: 1rem; background: rgba(0,0,0,0.3); border-radius: 0.5rem;">' + (error && error.stack || '無堆疊追蹤資訊') + '</pre>';
+        document.body.appendChild(div);
+        return false;
+      };
+      window.onunhandledrejection = function(event) {
+        var div = document.createElement('div');
+        div.style.position = 'fixed';
+        div.style.top = '0';
+        div.style.left = '0';
+        div.style.width = '100%';
+        div.style.height = '100%';
+        div.style.backgroundColor = '#f59e0b';
+        div.style.color = '#000000';
+        div.style.padding = '2rem';
+        div.style.zIndex = '999999';
+        div.style.fontFamily = 'monospace';
+        div.style.fontSize = '16px';
+        div.style.whiteSpace = 'pre-wrap';
+        div.style.overflowY = 'auto';
+        div.innerHTML = '<h2>🚨 未處理的 Promise Rejection</h2>' + 
+                        '<p><b>拒絕原因:</b> ' + event.reason + '</p>';
+        document.body.appendChild(div);
+      };
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
