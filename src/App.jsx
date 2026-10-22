@@ -3,30 +3,19 @@ import {
   FileText, Loader2, CheckCircle2, AlertCircle, Download, UploadCloud, 
   BarChart3, Filter, FileSpreadsheet, List, FileCheck, Scale, 
   ClipboardCheck, Trash2, Settings as SettingsIcon, Search, 
-  ChevronDown, ChevronUp, Plus, Check, HelpCircle, Edit, Cpu, Zap
+  ChevronDown, ChevronUp, Plus, Check, Cpu, Zap
 } from 'lucide-react';
 import SettingsPanel from './components/SettingsPanel';
 import ColumnMapperModal from './components/ColumnMapperModal';
+import { parseQuotationPage, normalizeQuotationAmounts, updateQuotationField, moneyNumber } from './utils/quotation';
 
-const DEFAULT_CATEGORIES = [
-  "滿貫大亨Web館", "網頁組", "明星3缺1", "滿貫大亨", 
-  "競技麻將2", "唯舞獨尊", "玩星派對", "social casino"
-];
-
-const DEFAULT_DEPT_MAP = {
-  '明星3缺1': '研五',
-  '競技麻將2': '研五',
-  'social casino': '研五',
-  '滿貫大亨': '研二',
-  '滿貫大亨Web館': '研二',
-  '玩星派對': '研三',
-  '唯舞獨尊': '研三'
-};
+import { DEFAULT_CATEGORIES, DEFAULT_DEPT_MAP, inferProjectCategory, normalizeQuotationIdentity, migrateProjectSettings } from './utils/projects';
+import { buildAcceptanceSummary } from './utils/acceptance';
 
 const App = () => {
   // --- Tab & Lib state ---
   const [activeTab, setActiveTab] = useState('parser'); // 'parser' | 'invoice' | 'compare' | 'acceptance' | 'settings'
-  const [libsLoaded, setLibsLoaded] = useState({ pdf: false, xlsx: false });
+  const [, setLibsLoaded] = useState({ pdf: false, xlsx: false });
 
   // --- Settings state ---
   const [settings, setSettings] = useState(() => {
@@ -34,17 +23,19 @@ const App = () => {
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        return {
+        return migrateProjectSettings({
+          categorySchemaVersion: parsed.categorySchemaVersion,
           apiKey: parsed.apiKey || '',
           modelName: parsed.modelName || 'gemini-3.5-flash',
           categories: parsed.categories || DEFAULT_CATEGORIES,
           deptMap: parsed.deptMap || DEFAULT_DEPT_MAP
-        };
+        });
       } catch (e) {
         console.error('Error parsing saved settings', e);
       }
     }
     return {
+      categorySchemaVersion: 2,
       apiKey: '',
       modelName: 'gemini-3.5-flash',
       categories: DEFAULT_CATEGORIES,
@@ -76,6 +67,9 @@ const App = () => {
   // --- Acceptance Editing State ---
   const [editableOrderIds, setEditableOrderIds] = useState('');
   const [editableDetails, setEditableDetails] = useState('');
+  const [editableDetailsWithoutPrefixes, setEditableDetailsWithoutPrefixes] = useState('');
+  const [hideProjectPrefixes, setHideProjectPrefixes] = useState(false);
+  const displayedDetails = hideProjectPrefixes ? editableDetailsWithoutPrefixes : editableDetails;
   const [copiedOrders, setCopiedOrders] = useState(false);
   const [copiedDetails, setCopiedDetails] = useState(false);
 
@@ -111,19 +105,45 @@ const App = () => {
     }
   }, []);
 
-  // Auto-resize textarea heights
+  // Reflow after content, viewport width or web-font changes.
   useEffect(() => {
-    if (activeTab === 'acceptance') {
-      if (orderIdsRef.current) {
-        orderIdsRef.current.style.height = 'auto';
-        orderIdsRef.current.style.height = `${orderIdsRef.current.scrollHeight}px`;
-      }
-      if (detailsRef.current) {
-        detailsRef.current.style.height = 'auto';
-        detailsRef.current.style.height = `${detailsRef.current.scrollHeight}px`;
-      }
-    }
-  }, [editableOrderIds, editableDetails, activeTab]);
+    if (activeTab !== 'acceptance') return;
+    const elements = [orderIdsRef.current, detailsRef.current].filter(Boolean);
+    let disposed = false;
+    let frameId = null;
+    const resize = () => {
+      if (disposed) return;
+      elements.forEach(element => {
+        element.style.height = 'auto';
+        element.style.height = `${element.scrollHeight + 2}px`;
+      });
+    };
+    const scheduleResize = () => {
+      if (disposed || frameId !== null) return;
+      frameId = requestAnimationFrame(() => {
+        frameId = null;
+        resize();
+      });
+    };
+    resize();
+    const widths = new WeakMap();
+    const observer = new ResizeObserver(entries => {
+      let changed = false;
+      entries.forEach(({ target, contentRect }) => {
+        if (widths.get(target) !== contentRect.width) changed = true;
+        widths.set(target, contentRect.width);
+      });
+      // Defer layout writes; resizing in the observer callback causes loop errors.
+      if (changed) scheduleResize();
+    });
+    elements.forEach(element => observer.observe(element.parentElement));
+    document.fonts?.ready.then(scheduleResize);
+    return () => {
+      disposed = true;
+      observer.disconnect();
+      if (frameId !== null) cancelAnimationFrame(frameId);
+    };
+  }, [editableOrderIds, displayedDetails, activeTab]);
 
   // --- 1. PDF page to image (For AI OCR) ---
   const pdfToImages = async (file) => {
@@ -156,17 +176,21 @@ const App = () => {
     
     【關鍵任務】
     1. 找到報價單核心行（格式通常為：6位數字:項目名稱）。
-    2. orderId: 提取該 6 位純數字。絕對禁止抓取 T 開頭的編號。
+    2. orderId: 提取該 6 位純數字。絕對禁止抓取 T 開頭的編號；若是 xxxxxx 等遮蔽範例，請填空字串，不得臆測。
     3. projectName: 提取冒號後的文字。特別注意：
        - 若名稱跨行（如「品\\n檢測試」），請將其無縫合併為單一字串（「品檢測試」）。
-       - 必須略過並移除名稱結尾的「功能測試」或「測試器材」。
+       - 完整保留專案名稱中的數字，例如「幸運草金幣7」「明星3缺1」「競技麻將2」「ATG遊戲74」「940串接」；不得刪除數字或改寫。
+       - 必須略過並移除名稱結尾的「功能測試」「計時制」「包人制」或「測試器材」。
     4. category: 對比 projectName 從 [${settings.categories.join(", ")}] 擇一，不符填"其他"。
+       - 「滿貫」對應「滿貫大亨」；「大滿貫」是獨立分類，不可合併至「滿貫大亨」，「競技麻將」對應「競技麻將2」，「滿貫Web館」對應「滿貫大亨Web館」；僅使用上列已設定的分類。
        - 【重要】若專案名稱中包含 "VF" 或 "vf"，請一律填寫為 "social casino"。
     5. 金額欄位：提取純數字。若圖中找不到該項目，請填 "0"。
-       - functionalTestAmount: 功能測試金額
+       - functionalTestAmount: 功能測試／計時制金額，不包含包人制
+       - personnelAmount: 包人費用（包含「功能測試 包人制」），同頁多筆請加總，絕不可同時計入 functionalTestAmount
+       - 各費用請取最右側「金額」欄，不要取數量或單價（例如單價 337.5、金額 2,700 時取 2700）
        - deviceAmount: 測試器材金額
        - managementFee: 管理費金額
-       - totalExclTax: 合計未稅
+       - totalExclTax: 合計未稅，包含計時功能測試、包人費用、測試器材及管理費，不包含營業稅；沒有明列未稅合計時將四項相加
     
     【輸出格式】
     {
@@ -174,6 +198,7 @@ const App = () => {
       "projectName": "string",
       "category": "string",
       "functionalTestAmount": "string",
+      "personnelAmount": "string",
       "deviceAmount": "string",
       "managementFee": "string",
       "totalExclTax": "string"
@@ -213,124 +238,7 @@ const App = () => {
 
   // --- 3. Local Fast PDF Text Parsing (Keyless fallback) ---
   const processFilesLocal = async (pdfFiles) => {
-    const cleanVal = (v) => {
-      if (v === undefined || v === null) return '0';
-      const s = v.toString().replace(/[.,元 ]/g, '').replace(/[^\d]/g, '');
-      return s || '0';
-    };
-
-    const extractNumber = (text, excludeId) => {
-      const regex = /\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\b/g;
-      let matches = [...text.matchAll(regex)].map(m => m[0].replace(/,/g, ''));
-      if (excludeId) {
-        matches = matches.filter(m => m !== excludeId);
-      }
-      if (matches.length === 0) {
-        const digits = text.replace(/[^\d]/g, '');
-        return digits || '0';
-      }
-      
-      const numbers = matches.map(m => parseInt(m, 10)).filter(n => !isNaN(n));
-      if (numbers.length === 0) return '0';
-      
-      let chosen = numbers[numbers.length - 1];
-      if (chosen <= 10 && numbers.length > 1) {
-        const larger = numbers.slice(0, -1).reverse().find(n => n > 100);
-        if (larger !== undefined) {
-          chosen = larger;
-        }
-      }
-      return chosen.toString();
-    };
-
     const generateId = () => Math.random().toString(36).substring(2, 15);
-
-    const makeFlexRegex = (keyword) => {
-      const chars = keyword.split('').map(c => c.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'));
-      return new RegExp(chars.join('\\s*'), 'i');
-    };
-
-    const METADATA_KEYWORDS = [
-      '聯絡人', '電話', '統一編號', '統編', '傳真', '地址', '日期', '頁次', '頁碼', 
-      'email', 'mail', '公司', '戶名', '帳號', '銀行', '分行', '報價單', 
-      '鈊象', '電子', '委託單位', '客戶', '備註', '說明', '期限',
-      'docusign', 'envelope', 'digital', 'hearts', 'linguitronics', 'taiwan', '電心萬象',
-      'no.', '服務項目', '內容摘要', '營業稅', '合計金額', '作業期間', '人員配置', '主管'
-    ];
-
-    const projectKeywords = ['專案名稱', '案件名稱', '案名', '品名'];
-
-    const cleanProjectNameCandidate = (line, orderId) => {
-      let s = line;
-      if (orderId) {
-        const escapedId = orderId.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
-        s = s.replace(new RegExp(escapedId, 'gi'), '');
-      }
-      // Remove numbers
-      s = s.replace(/\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\b/g, '');
-      s = s.replace(/\d+/g, '');
-      
-      // Remove keywords
-      const wordsToRemove = [
-        '功能測試', '測試器材', '管理費', '行政費', '服務費', '合計', '未稅', '總計', '小計',
-        '品名', '專案名稱', '專案管理', '專案', '案件名稱', '案名', '單號', '報價', '聯絡人', '電話'
-      ];
-      for (const w of wordsToRemove) {
-        s = s.replace(makeFlexRegex(w), '');
-      }
-      
-      s = s.replace(/[：:_\-–—\/\\*()（）\[\]「」{}|,\.\s]+/g, ' ').trim();
-      return s;
-    };
-
-    const compressSpaces = (str) => {
-      let s = str.replace(/(?<=[\u4e00-\u9fa5])\s+(?=[\u4e00-\u9fa5])/g, '');
-      s = s.replace(/(?<=[\u4e00-\u9fa5])\s+(?=\d)/g, '');
-      s = s.replace(/(?<=\d)\s+(?=[\u4e00-\u9fa5])/g, '');
-      s = s.replace(/\s+/g, ' ');
-      return s.trim();
-    };
-
-    const extractAmountWithNeighbors = (line, lineIdx, cleanLines, orderId) => {
-      let amt = extractNumber(line, orderId);
-      if (parseInt(amt, 10) === 0) {
-        // Check line above
-        if (lineIdx > 0) {
-          const prevLine = cleanLines[lineIdx - 1];
-          const prevClean = prevLine.replace(/\s+/g, '');
-          const isMeta = METADATA_KEYWORDS.some(kw => makeFlexRegex(kw).test(prevLine));
-          const isAnotherKeyword = [
-            '功能測試', '功能', '測試器材', '器材', '設備', '租借', 
-            '管理費', '行政', '服務費', '合計', '未稅', '總計', '小計'
-          ].some(kw => makeFlexRegex(kw).test(prevClean));
-          
-          if (!isMeta && !isAnotherKeyword) {
-            const candidateAmt = extractNumber(prevLine, orderId);
-            if (parseInt(candidateAmt, 10) > 0) {
-              amt = candidateAmt;
-            }
-          }
-        }
-        // Check line below
-        if (parseInt(amt, 10) === 0 && lineIdx < cleanLines.length - 1) {
-          const nextLine = cleanLines[lineIdx + 1];
-          const nextClean = nextLine.replace(/\s+/g, '');
-          const isMeta = METADATA_KEYWORDS.some(kw => makeFlexRegex(kw).test(nextLine));
-          const isAnotherKeyword = [
-            '功能測試', '功能', '測試器材', '器材', '設備', '租借', 
-            '管理費', '行政', '服務費', '合計', '未稅', '總計', '小計'
-          ].some(kw => makeFlexRegex(kw).test(nextClean));
-          
-          if (!isMeta && !isAnotherKeyword) {
-            const candidateAmt = extractNumber(nextLine, orderId);
-            if (parseInt(candidateAmt, 10) > 0) {
-              amt = candidateAmt;
-            }
-          }
-        }
-      }
-      return amt;
-    };
 
     for (let fIdx = 0; fIdx < pdfFiles.length; fIdx++) {
       const file = pdfFiles[fIdx];
@@ -343,173 +251,11 @@ const App = () => {
           const textContent = await page.getTextContent();
           const items = textContent.items;
 
-          // Group PDF text items by visual Y coordinates (rows)
-          const linesMap = {};
-          items.forEach(item => {
-            const y = Math.round(item.transform[5]);
-            let foundY = Object.keys(linesMap).find(key => Math.abs(Number(key) - y) < 6);
-            if (foundY) {
-              linesMap[foundY].push(item);
-            } else {
-              linesMap[y] = [item];
-            }
-          });
-
-          // Sort rows top-to-bottom and items left-to-right
-          const sortedY = Object.keys(linesMap).sort((a, b) => Number(b) - Number(a));
-          const lines = sortedY.map(y => {
-            const lineItems = linesMap[y].sort((a, b) => a.transform[4] - b.transform[4]);
-            return lineItems.map(item => item.str).join(' ');
-          });
-
-          const cleanLines = lines.map(l => l.trim()).filter(Boolean);
-
-          let orderId = '';
-          let projectName = '';
-          let functionalTestAmount = '0';
-          let deviceAmount = '0';
-          let managementFee = '0';
-          let totalExclTax = '0';
-
-          // Heuristic 1: Extract Order ID (ONLY 6-digit pure numbers, exclude years)
-          let matchedLineIdx = -1;
-          for (let i = 0; i < cleanLines.length; i++) {
-            const line = cleanLines[i];
-            const orderIdMatch = line.match(/\b\d{6}\b/);
-            if (orderIdMatch) {
-              const idCandidate = orderIdMatch[0];
-              const isYear = idCandidate.startsWith('202') || idCandidate.startsWith('199');
-              if (!isYear) {
-                orderId = idCandidate;
-                matchedLineIdx = i;
-                break;
-              }
-            }
-          }
-
-          // Heuristic 2: Extract Project Name
-          // Pass 1: Look for lines with project keywords
-          for (const line of cleanLines) {
-            const isMeta = METADATA_KEYWORDS.some(kw => makeFlexRegex(kw).test(line));
-            if (isMeta) continue;
-            
-            const matchedKw = projectKeywords.find(kw => makeFlexRegex(kw).test(line));
-            if (matchedKw) {
-              const regex = makeFlexRegex(matchedKw);
-              const match = line.match(regex);
-              if (match) {
-                const idx = match.index + match[0].length;
-                let candidate = line.substring(idx).trim();
-                candidate = cleanProjectNameCandidate(candidate, orderId);
-                candidate = compressSpaces(candidate);
-                if (candidate && candidate.length > 2) {
-                  projectName = candidate;
-                  break;
-                }
-              }
-            }
-          }
-
-          // Pass 2: Fallback - scan all lines for the first line that yields a valid project name
-          if (!projectName) {
-            for (const line of cleanLines) {
-              const isMeta = METADATA_KEYWORDS.some(kw => makeFlexRegex(kw).test(line));
-              if (isMeta) continue;
-              
-              let candidate = cleanProjectNameCandidate(line, orderId);
-              candidate = compressSpaces(candidate);
-              if (candidate && candidate.length > 2) {
-                projectName = candidate;
-                break;
-              }
-            }
-          }
-
-          // Heuristic 3: Extract amounts
-          for (let i = 0; i < cleanLines.length; i++) {
-            const line = cleanLines[i];
-            // Skip general metadata header lines to avoid extracting dates as amounts
-            const isMeta = METADATA_KEYWORDS.some(kw => makeFlexRegex(kw).test(line));
-            if (isMeta) continue;
-
-            const cleanLine = line.replace(/\s+/g, '');
-
-            if (makeFlexRegex('功能測試').test(cleanLine) || makeFlexRegex('功能').test(cleanLine)) {
-              const amt = extractAmountWithNeighbors(line, i, cleanLines, orderId);
-              if (parseInt(amt, 10) > 0) {
-                functionalTestAmount = amt;
-              }
-            }
-            if (makeFlexRegex('測試器材').test(cleanLine) || makeFlexRegex('器材').test(cleanLine) || makeFlexRegex('設備').test(cleanLine) || makeFlexRegex('租借').test(cleanLine)) {
-              const amt = extractAmountWithNeighbors(line, i, cleanLines, orderId);
-              if (parseInt(amt, 10) > 0) {
-                deviceAmount = amt;
-              }
-            }
-            if (makeFlexRegex('管理費').test(cleanLine) || makeFlexRegex('行政').test(cleanLine) || makeFlexRegex('服務費').test(cleanLine)) {
-              const amt = extractAmountWithNeighbors(line, i, cleanLines, orderId);
-              if (parseInt(amt, 10) > 0) {
-                managementFee = amt;
-              }
-            }
-            if ((makeFlexRegex('合計').test(cleanLine) || makeFlexRegex('未稅').test(cleanLine) || makeFlexRegex('總計').test(cleanLine) || makeFlexRegex('小計').test(cleanLine)) && !makeFlexRegex('金額').test(cleanLine)) {
-              const amt = extractAmountWithNeighbors(line, i, cleanLines, orderId);
-              if (parseInt(amt, 10) > 0) {
-                totalExclTax = amt;
-              }
-            }
-          }
-
-          // Recalculate total if parts found but total not explicitly matched
-          if (parseInt(totalExclTax, 10) === 0) {
-            const f = parseInt(functionalTestAmount, 10) || 0;
-            const d = parseInt(deviceAmount, 10) || 0;
-            const m = parseInt(managementFee, 10) || 0;
-            totalExclTax = (f + d + m).toString();
-          }
-
-          // Clean project name suffix
-          let finalProjectName = projectName
-            .replace(/T\d{7,11}/g, "")
-            .replace(/(功能測試|測試器材)$/, "")
-            .trim();
-
-          // Assign category
-          let category = '其他';
-          for (const cat of settings.categories) {
-            const cleanProj = finalProjectName.replace(/\s+/g, '');
-            const cleanCat = cat.replace(/\s+/g, '');
-            if (cleanProj.includes(cleanCat)) {
-              category = cat;
-              break;
-            }
-          }
-          if (finalProjectName.toUpperCase().includes('VF')) {
-            category = 'social casino';
-          }
-
-          const hasText = items.length > 0;
-          const hasParsedFields = orderId || parseInt(totalExclTax, 10) > 0;
-
           setResults(prev => [...prev, {
             id: generateId(),
             fileName: `${file.name} (P${pageIdx})`,
             status: 'success',
-            hasWarning: !hasParsedFields || !orderId || parseInt(totalExclTax, 10) === 0,
-            warningMsg: !hasText 
-              ? '本地解析無文字（此頁可能是掃描影像或圖片，您可在表格中直接手動編輯，或於設定啟用 AI OCR）' 
-              : (!orderId || parseInt(totalExclTax, 10) === 0)
-                ? '本地解析未成功識別所有欄位（單號或合計為 0，請點擊欄位直接手動修改補齊）'
-                : null,
-            data: {
-              orderId,
-              projectName: finalProjectName || (!hasText ? '⚠️ 掃描件 (請雙擊此處手動輸入專案名稱)' : '⚠️ 未識別案件 (請雙擊編輯)'),
-              category,
-              functionalTestAmount: cleanVal(functionalTestAmount),
-              deviceAmount: cleanVal(deviceAmount),
-              managementFee: cleanVal(managementFee),
-              totalExclTax: cleanVal(totalExclTax)
-            }
+            ...parseQuotationPage(items, settings.categories)
           }]);
         }
       } catch (err) {
@@ -552,12 +298,6 @@ const App = () => {
       return;
     }
 
-    const cleanVal = (v) => {
-      if (v === undefined || v === null) return '0';
-      const s = v.toString().replace(/[.,元 ]/g, '').replace(/[^\d]/g, '');
-      return s || '0';
-    };
-
     const generateId = () => Math.random().toString(36).substring(2, 15);
 
     try {
@@ -588,16 +328,7 @@ const App = () => {
           try {
             const data = await extractInfoAI(task.img);
             
-            let finalProjectName = (data.projectName || "")
-              .replace(/T\d{7,11}/g, "")
-              .replace(/\n|\r/g, "")
-              .replace(/(功能測試|測試器材)$/, "")
-              .trim();
-
-            let finalCategory = data.category;
-            if (finalProjectName.toUpperCase().includes("VF")) {
-              finalCategory = "social casino";
-            }
+            const identity = normalizeQuotationIdentity(data, settings.categories);
 
             setResults(prev => [...prev, {
               id: generateId(),
@@ -605,12 +336,8 @@ const App = () => {
               status: 'success',
               data: {
                 ...data,
-                category: finalCategory,
-                projectName: finalProjectName,
-                functionalTestAmount: cleanVal(data.functionalTestAmount),
-                deviceAmount: cleanVal(data.deviceAmount),
-                managementFee: cleanVal(data.managementFee),
-                totalExclTax: cleanVal(data.totalExclTax)
+                ...identity,
+                ...normalizeQuotationAmounts(data)
               }
             }]);
           } catch (err) {
@@ -768,21 +495,23 @@ const App = () => {
 
   // --- 6. Data Actions & Handlers ---
   const handleSaveSettings = (newSettings) => {
-    setSettings(newSettings);
-    localStorage.setItem('invoice_tool_settings', JSON.stringify(newSettings));
+    const updatedSettings = { ...newSettings, categorySchemaVersion: 2 };
+    setSettings(updatedSettings);
+    localStorage.setItem('invoice_tool_settings', JSON.stringify(updatedSettings));
+    setResults(prev => prev.map(item => item.status !== 'success' || item.categoryManuallySet ? item : {
+      ...item, data: { ...item.data, category: normalizeQuotationIdentity(item.data, newSettings.categories).category }
+    }));
   };
 
   const handlePDFFieldChange = (id, field, value) => {
     setResults(prev => prev.map(item => {
       if (item.id === id) {
-        const newData = { ...item.data, [field]: value };
-        if (field === 'functionalTestAmount' || field === 'deviceAmount' || field === 'managementFee') {
-          const fAmt = parseInt(newData.functionalTestAmount || 0, 10) || 0;
-          const dAmt = parseInt(newData.deviceAmount || 0, 10) || 0;
-          const mAmt = parseInt(newData.managementFee || 0, 10) || 0;
-          newData.totalExclTax = (fAmt + dAmt + mAmt).toString();
+        const newData = updateQuotationField(item.data, field, value);
+        if (field === 'projectName' && !item.categoryManuallySet) {
+          newData.category = inferProjectCategory(newData.projectName, settings.categories);
         }
-        return { ...item, data: newData };
+        const hasWarning = !newData.orderId.trim() || moneyNumber(newData.totalExclTax) === 0;
+        return { ...item, data: newData, categoryManuallySet: field === 'category' || item.categoryManuallySet, hasWarning, warningMsg: hasWarning ? '請補齊案件單號與未稅金額後再進行比對。' : null };
       }
       return item;
     }));
@@ -814,6 +543,7 @@ const App = () => {
         projectName: '新項目名稱',
         category: settings.categories[0] || '其他',
         functionalTestAmount: '0',
+        personnelAmount: '0',
         deviceAmount: '0',
         managementFee: '0',
         totalExclTax: '0'
@@ -850,7 +580,7 @@ const App = () => {
 
   const formatWithCommas = (num) => {
     if (num === null || num === undefined) return '-';
-    const val = typeof num === 'string' ? parseInt(num, 10) : num;
+    const val = moneyNumber(num);
     return isNaN(val) ? '0' : new Intl.NumberFormat('zh-TW').format(val);
   };
 
@@ -870,7 +600,7 @@ const App = () => {
 
   const pdfStats = useMemo(() => {
     const successItems = filteredResults.filter(r => r.status === 'success');
-    const totalAmount = successItems.reduce((sum, r) => sum + (parseInt(r.data.totalExclTax, 10) || 0), 0);
+    const totalAmount = successItems.reduce((sum, r) => sum + moneyNumber(r.data.totalExclTax), 0);
     return {
       totalCount: filteredResults.length,
       successCount: successItems.length,
@@ -897,7 +627,7 @@ const App = () => {
 
   // Export CSV
   const exportToCSV = () => {
-    const header = "\uFEFF專案分類,單號,案件名稱,功能測試,測試器材,管理費,合計未稅\n";
+    const header = "\uFEFF專案分類,單號,案件名稱,功能測試（計時）,包人費用,測試器材,管理費,合計未稅\n";
     const sortedSuccess = [...filteredResults]
       .filter(r => r.status === 'success')
       .sort((a, b) => {
@@ -907,7 +637,7 @@ const App = () => {
       });
 
     const rows = sortedSuccess.map(r => {
-      return `"${r.data.category}","${r.data.orderId}","${r.data.projectName}",${r.data.functionalTestAmount},${r.data.deviceAmount},${r.data.managementFee},${r.data.totalExclTax}`;
+      return `"${r.data.category}","${r.data.orderId}","${r.data.projectName}",${r.data.functionalTestAmount},${r.data.personnelAmount || 0},${r.data.deviceAmount},${r.data.managementFee},${r.data.totalExclTax}`;
     }).join("\n");
 
     const blob = new Blob([header + rows], { type: 'text/csv;charset=utf-8;' });
@@ -930,7 +660,7 @@ const App = () => {
       if (!pdfMap[id]) {
         pdfMap[id] = { total: 0, items: [] };
       }
-      pdfMap[id].total += parseInt(r.data.totalExclTax || 0, 10);
+      pdfMap[id].total += moneyNumber(r.data.totalExclTax);
       pdfMap[id].items.push(r);
     });
 
@@ -1018,81 +748,13 @@ const App = () => {
   }, [comparisonResults]);
 
   // --- 9. Acceptance Sheet Summary Logic ---
-  const acceptanceData = useMemo(() => {
-    const validResults = results.filter(r => r.status === 'success');
-    const deptOrder = { '研五': 1, '研二': 2, '研三': 3, '其他': 4 };
-    let overallTotal = 0;
-
-    const grouped = validResults.reduce((acc, curr) => {
-      const cat = curr.data.category;
-      const dept = settings.deptMap[cat] || '其他';
-      
-      if (!acc[cat]) {
-        acc[cat] = {
-          dept,
-          category: cat,
-          orderIds: [],
-          projectNames: [],
-          totalAmount: 0,
-          deptRank: deptOrder[dept] || 99
-        };
-      }
-      
-      if (curr.data.orderId) acc[cat].orderIds.push(curr.data.orderId);
-      if (curr.data.projectName) acc[cat].projectNames.push(curr.data.projectName);
-      acc[cat].totalAmount += (parseInt(curr.data.totalExclTax || 0, 10) || 0);
-      return acc;
-    }, {});
-
-    const sortedCats = Object.values(grouped).sort((a, b) => {
-      if (a.deptRank !== b.deptRank) return a.deptRank - b.deptRank;
-      return a.category.localeCompare(b.category, 'zh-TW');
-    });
-
-    const allOrderIds = sortedCats.flatMap(g => g.orderIds).filter(Boolean);
-
-    const cleanProjectName = (name, category) => {
-      if (category === 'social casino') return name;
-
-      let cleaned = name;
-      const prefixes = [
-        `${category}_`, `${category}-`, `${category} `,
-        `【${category}】`, `[${category}]`,
-        `滿貫Web館_`
-      ];
-      for (const p of prefixes) {
-        if (cleaned.startsWith(p)) {
-          cleaned = cleaned.substring(p.length).trim();
-          break;
-        }
-      }
-      return cleaned;
-    };
-
-    const boxLines = sortedCats.map(g => {
-      const cleanedNames = g.projectNames.map(name => cleanProjectName(name, g.category));
-      const uniqueProjects = [...new Set(cleanedNames.filter(n => n))];
-      
-      let prefix = g.category;
-      if (g.category === '滿貫大亨' || g.category === 'social casino') prefix = '';
-      
-      const displayName = prefix ? `${prefix}_${uniqueProjects.join('、')}` : uniqueProjects.join('、');
-      overallTotal += g.totalAmount;
-
-      return `【${g.dept}】【${g.category}】${displayName}  共${formatWithCommas(g.totalAmount)}`;
-    });
-
-    return {
-      orderIdsText: allOrderIds.join('、'),
-      detailsText: boxLines.join('\n'),
-      overallTotal
-    };
-  }, [results, settings]);
+  const acceptanceData = useMemo(() => buildAcceptanceSummary(results, settings.deptMap), [results, settings.deptMap]);
 
   // Sync to textareas
   useEffect(() => {
     setEditableOrderIds(acceptanceData.orderIdsText);
     setEditableDetails(acceptanceData.detailsText);
+    setEditableDetailsWithoutPrefixes(acceptanceData.detailsWithoutPrefixesText);
   }, [acceptanceData]);
 
   const copyToClipboard = (text) => {
@@ -1347,13 +1009,14 @@ const App = () => {
             {/* Parsed List Table */}
             {results.length > 0 && (
               <div className="table-container">
-                <table>
+                <table className="quotation-table">
                   <thead>
                     <tr>
                       <th style={{ width: '140px' }}>專案分類</th>
                       <th style={{ width: '120px' }}>單號</th>
-                      <th>案件名稱</th>
-                      <th style={{ textAlign: 'right', width: '110px' }}>功能測試</th>
+                      <th style={{ width: '300px' }}>案件名稱</th>
+                      <th style={{ textAlign: 'right', width: '130px' }}>功能測試（計時）</th>
+                      <th style={{ textAlign: 'right', width: '110px' }}>包人費用</th>
                       <th style={{ textAlign: 'right', width: '110px' }}>測試器材</th>
                       <th style={{ textAlign: 'right', width: '110px' }}>管理費</th>
                       <th style={{ textAlign: 'right', width: '120px' }}>合計未稅</th>
@@ -1365,7 +1028,7 @@ const App = () => {
                     {sortedCategories.map(category => (
                       <React.Fragment key={category}>
                         <tr className="category-header-row">
-                          <td colSpan="9">
+                          <td colSpan="10">
                             📁 {category} <span style={{ fontSize: '0.8rem', fontWeight: 'normal', color: 'var(--text-muted)' }}>({groupedResults[category].length} 筆)</span>
                           </td>
                         </tr>
@@ -1440,6 +1103,19 @@ const App = () => {
                                     type="text"
                                     value={item.data.functionalTestAmount}
                                     onChange={(e) => handlePDFFieldChange(item.id, 'functionalTestAmount', e.target.value)}
+                                    className="table-input number"
+                                  />
+                                ) : '-'}
+                              </td>
+
+                              {/* Personnel Amount */}
+                              <td style={{ textAlign: 'right' }}>
+                                {item.status === 'success' ? (
+                                  <input
+                                    type="text"
+                                    aria-label="包人費用"
+                                    value={item.data.personnelAmount || '0'}
+                                    onChange={(e) => handlePDFFieldChange(item.id, 'personnelAmount', e.target.value)}
                                     className="table-input number"
                                   />
                                 ) : '-'}
@@ -1878,6 +1554,10 @@ const App = () => {
                                                 <div>
                                                   <div className="drilldown-item-name">{p.data.projectName}</div>
                                                   <div className="drilldown-item-meta">{p.fileName} | {p.data.category}</div>
+                                                  <div className="drilldown-item-meta">
+                                                    功能測試（計時） $ {formatWithCommas(p.data.functionalTestAmount)} · 包人費用 $ {formatWithCommas(p.data.personnelAmount || 0)}<br />
+                                                    測試器材 $ {formatWithCommas(p.data.deviceAmount)} · 管理費 $ {formatWithCommas(p.data.managementFee)}
+                                                  </div>
                                                 </div>
                                                 <div className="drilldown-item-val">$ {formatWithCommas(p.data.totalExclTax)}</div>
                                               </div>
@@ -1978,6 +1658,17 @@ const App = () => {
                   <div className="acceptance-block-title">
                     <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
                       <span>2. 費用金額總結</span>
+                      <button
+                        className="btn btn-secondary"
+                        style={{ padding: '0.4rem 0.75rem', fontSize: '0.8rem' }}
+                        aria-pressed={hideProjectPrefixes}
+                        onClick={() => {
+                          setHideProjectPrefixes(hidden => !hidden);
+                          setCopiedDetails(false);
+                        }}
+                      >
+                        {hideProjectPrefixes ? '顯示專案前綴' : '隱藏專案前綴'}
+                      </button>
                       <span className="badge badge-primary" style={{ padding: '0.4rem 1rem', fontSize: '0.9rem' }}>
                         全部總計: $ {formatWithCommas(acceptanceData.overallTotal)}
                       </span>
@@ -1986,7 +1677,7 @@ const App = () => {
                       className={`btn ${copiedDetails ? 'btn-success' : 'btn-secondary'}`}
                       style={{ padding: '0.4rem 1rem', fontSize: '0.8rem', gap: '0.3rem' }}
                       onClick={() => {
-                        copyToClipboard(editableDetails);
+                        copyToClipboard(displayedDetails);
                         setCopiedDetails(true);
                         setTimeout(() => setCopiedDetails(false), 2000);
                       }}
@@ -1995,10 +1686,19 @@ const App = () => {
                       {copiedDetails ? '已複製！' : '複製明細'}
                     </button>
                   </div>
+                  <div className="acceptance-subtotals" aria-label="各專案未稅小計">
+                    {acceptanceData.groups.map(group => (
+                      <div className="acceptance-subtotal" key={group.category}>
+                        <span>【{group.dept}】{group.category}</span>
+                        <strong>$ {formatWithCommas(group.totalAmount)}</strong>
+                      </div>
+                    ))}
+                  </div>
                   <textarea
+                    aria-label="驗收明細與總計"
                     ref={detailsRef}
-                    value={editableDetails}
-                    onChange={(e) => setEditableDetails(e.target.value)}
+                    value={displayedDetails}
+                    onChange={(e) => (hideProjectPrefixes ? setEditableDetailsWithoutPrefixes : setEditableDetails)(e.target.value)}
                     className="acceptance-textarea details"
                     placeholder="無明細資料"
                   />

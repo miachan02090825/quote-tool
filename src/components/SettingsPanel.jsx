@@ -1,26 +1,7 @@
-import React, { useState } from 'react';
-import { Save, RotateCcw, Key, Cpu, Tag, Network, Eye, EyeOff } from 'lucide-react';
+import { useState } from 'react';
+import { Save, RotateCcw, Key, Cpu, Tag, Eye, EyeOff } from 'lucide-react';
 
-const DEFAULT_CATEGORIES = [
-  "滿貫大亨Web館",
-  "網頁組",
-  "明星3缺1",
-  "滿貫大亨",
-  "競技麻將2",
-  "唯舞獨尊",
-  "玩星派對",
-  "social casino"
-];
-
-const DEFAULT_DEPT_MAP = {
-  '明星3缺1': '研五',
-  '競技麻將2': '研五',
-  'social casino': '研五',
-  '滿貫大亨': '研二',
-  '滿貫大亨Web館': '研二',
-  '玩星派對': '研三',
-  '唯舞獨尊': '研三'
-};
+import { DEFAULT_CATEGORIES, DEFAULT_DEPT_MAP } from '../utils/projects';
 
 const SettingsPanel = ({ settings, onSaveSettings }) => {
   const [apiKey, setApiKey] = useState(settings.apiKey || '');

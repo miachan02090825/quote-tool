@@ -306,6 +306,7 @@ body {
 
 /* Main Content Workspace */
 .main-content {
+  min-width: 0;
   flex-grow: 1;
   margin-left: 310px; /* Adjusting for floating sidebar (280px + gap) */
   padding: 2.25rem 2.75rem;
@@ -700,6 +701,11 @@ select {
   margin-bottom: 2rem;
 }
 
+.quotation-table {
+  min-width: 1400px;
+  table-layout: fixed;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -1088,17 +1094,20 @@ tr:hover td {
 
 /* Acceptance View IDE Terminal Overhaul */
 .acceptance-card {
+  min-width: 0;
+  max-width: 100%;
   padding: 2.25rem;
   border-color: rgba(255,255,255,0.04);
   background: rgba(10, 15, 32, 0.25);
 }
 
 .acceptance-block {
+  min-width: 0;
   margin-bottom: 2.25rem;
   background: #030611; /* Cyber Terminal base */
   border: 1px solid rgba(255, 255, 255, 0.05);
   border-radius: 1rem;
-  overflow: hidden;
+  overflow: visible;
   box-shadow: 0 15px 40px rgba(0, 0, 0, 0.4);
 }
 
@@ -1107,6 +1116,7 @@ tr:hover td {
 }
 
 .acceptance-block-title {
+  border-radius: 1rem 1rem 0 0;
   font-size: 0.85rem;
   font-weight: 700;
   color: var(--text-bright);
@@ -1117,6 +1127,44 @@ tr:hover td {
   justify-content: space-between;
   align-items: center;
   letter-spacing: 0.5px;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.acceptance-block-title > div {
+  flex-wrap: wrap;
+}
+
+.acceptance-subtotals {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+  gap: 0.65rem;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.acceptance-subtotal {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem 1rem;
+  padding: 0.75rem;
+  background: rgba(168, 85, 247, 0.06);
+  border-radius: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.acceptance-subtotal strong {
+  color: var(--purple-light);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
+.acceptance-subtotal > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .acceptance-textarea {
@@ -1126,14 +1174,18 @@ tr:hover td {
   border-radius: 0;
   padding: 1.25rem;
   color: #06b6d4; /* Neon cyan code text */
-  font-family: var(--font-mono);
+  font-family: "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", var(--font-sans);
   font-size: 0.95rem;
-  line-height: 1.6;
+  line-height: 1.9;
   resize: none;
   min-height: 110px;
   outline: none;
   box-shadow: none !important;
   display: block;
+  overflow-wrap: anywhere;
+  overflow-x: auto;
+  transition: none;
+  border-radius: 0 0 1rem 1rem;
 }
 
 .acceptance-textarea.details {
@@ -1182,6 +1234,9 @@ tr:hover td {
 }
 
 @media (max-width: 768px) {
+  .acceptance-card {
+    padding: 1rem;
+  }
   .page-header {
     flex-direction: column;
     align-items: flex-start;
